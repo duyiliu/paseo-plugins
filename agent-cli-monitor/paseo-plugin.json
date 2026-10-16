@@ -1,0 +1,9 @@
+{
+  "id": "agent-cli-monitor",
+  "name": "Agent CLI Monitor",
+  "description": "查看本机正在运行的 agent CLI 实例数量和内存占用",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.11.1"
+  }
+}
