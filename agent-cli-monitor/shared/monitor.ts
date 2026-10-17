@@ -7,20 +7,24 @@ const childProcess = z.object({
   rssBytes: z.number(),
 });
 
-const cliInstance = z.object({
-  pid: z.number(),
-  rssBytes: z.number(),
-  command: z.string(),
-  children: z.array(childProcess),
-  totalRssBytes: z.number(),
-});
-
 const agentSession = z.object({
   id: z.string(),
   title: z.string().nullable(),
   provider: z.string().nullable(),
   status: z.string(),
   cwd: z.string().nullable(),
+  archivedAt: z.string().nullable(),
+});
+
+const cliInstance = z.object({
+  pid: z.number(),
+  rssBytes: z.number(),
+  command: z.string(),
+  agentId: z.string().nullable(),
+  agentCwd: z.string().nullable(),
+  agent: agentSession.nullable(),
+  children: z.array(childProcess),
+  totalRssBytes: z.number(),
 });
 
 export const monitorSnapshot = defineRpc({
@@ -40,5 +44,16 @@ export const monitorSnapshot = defineRpc({
         items: z.array(agentSession),
       })
       .nullable(),
+  }),
+});
+
+export const monitorCloseAgent = defineRpc({
+  name: "monitor.close_agent",
+  input: z.object({
+    agentId: z.string(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
   }),
 });

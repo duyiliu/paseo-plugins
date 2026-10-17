@@ -1,9 +1,9 @@
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import { monitorSnapshot } from "../shared/monitor";
+import { monitorCloseAgent, monitorSnapshot } from "../shared/monitor";
 
 export const MONITOR_QUERY_KEY = ["agent-cli-monitor.snapshot"];
 export const MONITOR_REFETCH_MS = 5 * 60 * 1000;
@@ -19,6 +19,7 @@ function formatClock(iso: string): string {
 
 export function MonitorScreen({ theme, layout }: PluginScreenProps) {
   const snapshot = useRpc(monitorSnapshot);
+  const closeAgent = useRpc(monitorCloseAgent);
   const query = useQuery({
     queryKey: MONITOR_QUERY_KEY,
     queryFn: () => snapshot({}),
@@ -26,6 +27,34 @@ export function MonitorScreen({ theme, layout }: PluginScreenProps) {
   });
   const data = query.data;
   const compact = layout.compact;
+  const [confirmPid, setConfirmPid] = useState<number | null>(null);
+  const [closingPid, setClosingPid] = useState<number | null>(null);
+  const [closeError, setCloseError] = useState<string | null>(null);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleClose = (pid: number, agentId: string | null | undefined) => {
+    if (!agentId || closingPid === pid) return;
+    if (confirmPid !== pid) {
+      setConfirmPid(pid);
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+      confirmTimer.current = setTimeout(() => setConfirmPid(null), 3000);
+      return;
+    }
+    setConfirmPid(null);
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    setClosingPid(pid);
+    setCloseError(null);
+    void closeAgent({ agentId })
+      .then((res) => {
+        if (!res.ok) setCloseError(res.error ?? "关闭失败");
+        // The provider process exits asynchronously after closeAgent persists
+        // the snapshot — refresh once now and again shortly after.
+        void query.refetch();
+        setTimeout(() => void query.refetch(), 2000);
+      })
+      .catch((error) => setCloseError(error instanceof Error ? error.message : String(error)))
+      .finally(() => setClosingPid(null));
+  };
   const styles = useMemo(
     () => ({
       screen: {
@@ -65,6 +94,19 @@ export function MonitorScreen({ theme, layout }: PluginScreenProps) {
         backgroundColor: theme.colors.accent,
       },
       buttonText: { color: theme.colors.accentForeground, fontSize: 13 },
+      closeButton: {
+        paddingHorizontal: 8,
+        paddingVertical: 3,
+        borderRadius: 6,
+        borderWidth: 1,
+        borderColor: theme.colors.foregroundMuted,
+      },
+      closeButtonText: { color: theme.colors.foregroundMuted, fontSize: 11 },
+      closeButtonConfirm: {
+        borderColor: theme.colors.accent,
+        backgroundColor: theme.colors.accent,
+      },
+      closeButtonConfirmText: { color: theme.colors.accentForeground, fontSize: 11 },
       mutedText: { color: theme.colors.foregroundMuted, fontSize: 13 },
     }),
     [theme, compact],
@@ -101,28 +143,72 @@ export function MonitorScreen({ theme, layout }: PluginScreenProps) {
 
       <Text style={styles.sectionTitle}>实例明细</Text>
       <ScrollView style={{ flex: 1 }}>
-        {(data?.instances ?? []).map((instance) => (
-          <View key={instance.pid}>
-            <View style={styles.instanceRow}>
-              <Text style={styles.name} numberOfLines={1}>
-                devin
+        {(data?.instances ?? []).map((instance) => {
+          const agent = instance.agent;
+          const agentLabel = agent?.title
+            ? agent.title
+            : instance.agentId
+              ? `agent ${instance.agentId.slice(0, 8)}`
+              : "未关联 agent";
+          const metaParts: string[] = [];
+          if (instance.agentId) metaParts.push(instance.agentId.slice(0, 7));
+          if (agent) metaParts.push(agent.archivedAt ? "已归档" : agent.status);
+          if (instance.agentCwd) metaParts.push(instance.agentCwd);
+          return (
+            <View key={instance.pid}>
+              <View style={styles.instanceRow}>
+                <Text style={styles.name} numberOfLines={1}>
+                  {agentLabel}
+                </Text>
+                <Text style={styles.pid}>{instance.pid}</Text>
+                <Text style={styles.mem}>{formatMb(instance.totalRssBytes)} MB</Text>
+                {instance.agentId ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={confirmPid === instance.pid ? "确认关闭" : "关闭"}
+                    disabled={closingPid === instance.pid}
+                    style={[
+                      styles.closeButton,
+                      confirmPid === instance.pid ? styles.closeButtonConfirm : null,
+                    ]}
+                    onPress={() => handleClose(instance.pid, instance.agentId)}
+                  >
+                    <Text
+                      style={
+                        confirmPid === instance.pid
+                          ? styles.closeButtonConfirmText
+                          : styles.closeButtonText
+                      }
+                    >
+                      {closingPid === instance.pid
+                        ? "…"
+                        : confirmPid === instance.pid
+                          ? "确认?"
+                          : "关闭"}
+                    </Text>
+                  </Pressable>
+                ) : null}
+              </View>
+              {metaParts.length > 0 ? (
+                <Text style={styles.command} numberOfLines={1}>
+                  {metaParts.join(" · ")}
+                </Text>
+              ) : null}
+              <Text style={styles.command} numberOfLines={1}>
+                {instance.command}
               </Text>
-              <Text style={styles.pid}>{instance.pid}</Text>
-              <Text style={styles.mem}>{formatMb(instance.totalRssBytes)} MB</Text>
+              {instance.children.map((child) => (
+                <Text key={child.pid} style={styles.childRow} numberOfLines={1}>
+                  └ {child.name} {child.pid} {formatMb(child.rssBytes)} MB
+                </Text>
+              ))}
             </View>
-            <Text style={styles.command} numberOfLines={1}>
-              {instance.command}
-            </Text>
-            {instance.children.map((child) => (
-              <Text key={child.pid} style={styles.childRow} numberOfLines={1}>
-                └ {child.name} {child.pid} {formatMb(child.rssBytes)} MB
-              </Text>
-            ))}
-          </View>
-        ))}
+          );
+        })}
         {data && data.instances.length === 0 ? (
           <Text style={styles.mutedText}>当前没有运行中的 devin 进程。</Text>
         ) : null}
+        {closeError ? <Text style={styles.mutedText}>关闭失败:{closeError}</Text> : null}
       </ScrollView>
 
       <Pressable
