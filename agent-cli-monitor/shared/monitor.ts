@@ -20,6 +20,7 @@ const cliInstance = z.object({
   pid: z.number(),
   rssBytes: z.number(),
   command: z.string(),
+  startedAt: z.string().nullable(),
   agentId: z.string().nullable(),
   agentCwd: z.string().nullable(),
   agent: agentSession.nullable(),

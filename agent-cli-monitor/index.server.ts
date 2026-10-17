@@ -21,7 +21,7 @@ export default function contribute(server: PluginServerContext) {
         }
         let agent = agentById.get(instance.agentId) ?? null;
         if (!agent) {
-          agent = await resolveAgentSummary(paseo, instance.agentId);
+          agent = await resolveAgentSummary(instance.agentId);
           if (agent) {
             agentById.set(agent.id, agent);
             agents?.items.push(agent);
@@ -42,16 +42,22 @@ export default function contribute(server: PluginServerContext) {
   });
 
   server.handle(monitorCloseAgent, async ({ agentId }, { paseo }) => {
-    const agents = await listAgentSessions(paseo);
-    // The caller agent must be currently loaded by the daemon. Prefer live,
-    // non-archived agents other than the close target; the target itself is a
-    // last-resort caller (closing itself still executes server-side).
+    const [agents, liveInstances] = await Promise.all([
+      listAgentSessions(paseo),
+      listDevinInstances(),
+    ]);
+    // The caller must be currently loaded by the daemon — agents owning a live
+    // devin process provably are. Try them first, then the target itself (also
+    // loaded whenever it has a process), then the rest as a fallback sweep.
+    const liveIds = new Set(
+      liveInstances.map((i) => i.agentId).filter((id): id is string => !!id),
+    );
     const candidates = (agents?.items ?? [])
       .slice()
       .sort((a, b) => {
-        const aScore = (a.id === agentId ? 2 : 0) + (a.archivedAt ? 1 : 0);
-        const bScore = (b.id === agentId ? 2 : 0) + (b.archivedAt ? 1 : 0);
-        return aScore - bScore;
+        const score = (s: AgentSessionSummary) =>
+          (liveIds.has(s.id) ? 0 : 100) + (s.id === agentId ? 10 : 0) + (s.archivedAt ? 5 : 0);
+        return score(a) - score(b);
       });
     const errors: string[] = [];
     for (const caller of candidates) {

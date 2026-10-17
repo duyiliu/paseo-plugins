@@ -6,7 +6,6 @@ import { Pressable, ScrollView, Text, View } from "react-native";
 import { monitorCloseAgent, monitorSnapshot } from "../shared/monitor";
 
 export const MONITOR_QUERY_KEY = ["agent-cli-monitor.snapshot"];
-export const MONITOR_REFETCH_MS = 5 * 60 * 1000;
 
 export function formatMb(bytes: number): string {
   return (bytes / 1048576).toFixed(0);
@@ -17,13 +16,23 @@ function formatClock(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString();
 }
 
-export function MonitorScreen({ theme, layout }: PluginScreenProps) {
+function formatAge(iso: string): string | null {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return null;
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+export function MonitorScreen({ theme, layout, navigation }: PluginScreenProps) {
   const snapshot = useRpc(monitorSnapshot);
   const closeAgent = useRpc(monitorCloseAgent);
   const query = useQuery({
     queryKey: MONITOR_QUERY_KEY,
     queryFn: () => snapshot({}),
-    refetchInterval: MONITOR_REFETCH_MS,
+    staleTime: Infinity,
   });
   const data = query.data;
   const compact = layout.compact;
@@ -76,6 +85,7 @@ export function MonitorScreen({ theme, layout }: PluginScreenProps) {
         borderBottomColor: theme.colors.foregroundMuted,
       },
       name: { color: theme.colors.foreground, flex: 1, fontSize: 13 },
+      nameLink: { color: theme.colors.accent, flex: 1, fontSize: 13 },
       pid: { color: theme.colors.foregroundMuted, fontSize: 12, fontVariant: ["tabular-nums" as const] },
       mem: {
         color: theme.colors.foreground,
@@ -153,13 +163,28 @@ export function MonitorScreen({ theme, layout }: PluginScreenProps) {
           const metaParts: string[] = [];
           if (instance.agentId) metaParts.push(instance.agentId.slice(0, 7));
           if (agent) metaParts.push(agent.archivedAt ? "已归档" : agent.status);
+          const age = instance.startedAt ? formatAge(instance.startedAt) : null;
+          if (age) metaParts.push(`运行 ${age}`);
           if (instance.agentCwd) metaParts.push(instance.agentCwd);
           return (
             <View key={instance.pid}>
               <View style={styles.instanceRow}>
-                <Text style={styles.name} numberOfLines={1}>
-                  {agentLabel}
-                </Text>
+                {instance.agentId && navigation?.openAgent ? (
+                  <Pressable
+                    accessibilityRole="link"
+                    accessibilityLabel={`打开 agent ${agentLabel}`}
+                    style={{ flex: 1 }}
+                    onPress={() => navigation.openAgent?.({ agentId: instance.agentId! })}
+                  >
+                    <Text style={styles.nameLink} numberOfLines={1}>
+                      {agentLabel}
+                    </Text>
+                  </Pressable>
+                ) : (
+                  <Text style={styles.name} numberOfLines={1}>
+                    {agentLabel}
+                  </Text>
+                )}
                 <Text style={styles.pid}>{instance.pid}</Text>
                 <Text style={styles.mem}>{formatMb(instance.totalRssBytes)} MB</Text>
                 {instance.agentId ? (

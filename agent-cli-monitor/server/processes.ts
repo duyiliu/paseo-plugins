@@ -19,6 +19,7 @@ export interface CliInstance {
   pid: number;
   rssBytes: number;
   command: string;
+  startedAt: string | null;
   agentId: string | null;
   agentCwd: string | null;
   agent: AgentSessionSummary | null;
@@ -32,6 +33,7 @@ interface RawProcess {
   name: string;
   rssBytes: number;
   command: string;
+  startedAt: string | null;
   agentId: string | null;
   agentCwd: string | null;
 }
@@ -106,8 +108,10 @@ public static class ProcEnv {
 Add-Type -TypeDefinition $source -Language CSharp
 $cmds = @{}
 $agentEnv = @{}
-Get-CimInstance Win32_Process -Filter "Name='devin.exe'" -Property ProcessId,CommandLine | ForEach-Object {
+$created = @{}
+Get-CimInstance Win32_Process -Filter "Name='devin.exe'" -Property ProcessId,CommandLine,CreationDate | ForEach-Object {
   $cmds[[string]$_.ProcessId] = $_.CommandLine
+  if ($_.CreationDate) { $created[[string]$_.ProcessId] = ([datetime]$_.CreationDate).ToUniversalTime().ToString("o") }
   $agentId = $null
   $agentCwd = $null
   $block = [ProcEnv]::ReadEnvBlock([int]$_.ProcessId, 262144)
@@ -119,7 +123,7 @@ Get-CimInstance Win32_Process -Filter "Name='devin.exe'" -Property ProcessId,Com
   }
   $agentEnv[[string]$_.ProcessId] = @{ agentId = $agentId; agentCwd = $agentCwd }
 }
-$rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize,@{N='CommandLine';E={$cmds[[string]$_.ProcessId]}},@{N='AgentId';E={$agentEnv[[string]$_.ProcessId].agentId}},@{N='AgentCwd';E={$agentEnv[[string]$_.ProcessId].agentCwd}})
+$rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize,@{N='CommandLine';E={$cmds[[string]$_.ProcessId]}},@{N='StartedAt';E={$created[[string]$_.ProcessId]}},@{N='AgentId';E={$agentEnv[[string]$_.ProcessId].agentId}},@{N='AgentCwd';E={$agentEnv[[string]$_.ProcessId].agentCwd}})
 if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json -Compress }
 `;
 
@@ -150,6 +154,7 @@ async function listWindows(): Promise<RawProcess[]> {
       Name?: string;
       WorkingSetSize?: number;
       CommandLine?: string | null;
+      StartedAt?: string | null;
       AgentId?: string | null;
       AgentCwd?: string | null;
     };
@@ -160,6 +165,7 @@ async function listWindows(): Promise<RawProcess[]> {
       name: r.Name,
       rssBytes: r.WorkingSetSize ?? 0,
       command: r.CommandLine ?? "",
+      startedAt: r.StartedAt ?? null,
       agentId: r.AgentId ?? null,
       agentCwd: r.AgentCwd ?? null,
     });
@@ -194,6 +200,25 @@ async function readPosixAgentEnv(pid: number): Promise<{ agentId: string | null;
   }
 }
 
+// `ps -o etime=` reports [[dd-]hh:]mm:ss — no locale issues unlike lstart.
+async function readPosixStartedAt(pid: number): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], {
+      maxBuffer: MAX_BUFFER,
+    });
+    const match = /(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)/.exec(stdout.trim());
+    if (!match) return null;
+    const days = Number(match[1] ?? 0);
+    const hours = Number(match[2] ?? 0);
+    const minutes = Number(match[3]);
+    const seconds = Number(match[4]);
+    const elapsedMs = ((days * 24 + hours) * 60 + minutes) * 60_000 + seconds * 1000;
+    return new Date(Date.now() - elapsedMs).toISOString();
+  } catch {
+    return null;
+  }
+}
+
 async function listPosix(): Promise<RawProcess[]> {
   const { stdout } = await execFileAsync("ps", ["-eo", "pid=,ppid=,rss=,comm=,args="], {
     maxBuffer: MAX_BUFFER,
@@ -209,6 +234,7 @@ async function listPosix(): Promise<RawProcess[]> {
       name: comm.split("/").pop() ?? comm,
       rssBytes: Number(rssKbText) * 1024,
       command: args,
+      startedAt: null,
       agentId: null,
       agentCwd: null,
     });
@@ -258,6 +284,7 @@ function buildInstances(processes: RawProcess[]): CliInstance[] {
       pid: proc.pid,
       rssBytes: proc.rssBytes,
       command: truncate(proc.command, 240),
+      startedAt: proc.startedAt,
       agentId: proc.agentId,
       agentCwd: proc.agentCwd,
       agent: null,
@@ -274,9 +301,13 @@ export async function listDevinInstances(): Promise<CliInstance[]> {
   if (process.platform !== "win32") {
     await Promise.all(
       instances.map(async (instance) => {
-        const env = await readPosixAgentEnv(instance.pid);
+        const [env, startedAt] = await Promise.all([
+          readPosixAgentEnv(instance.pid),
+          readPosixStartedAt(instance.pid),
+        ]);
         instance.agentId = env.agentId;
         instance.agentCwd = env.agentCwd;
+        instance.startedAt = startedAt;
       }),
     );
   }

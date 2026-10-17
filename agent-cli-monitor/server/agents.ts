@@ -1,3 +1,5 @@
+import { readAgentRecordJson } from "./records";
+
 export interface AgentSessionSummary {
   id: string;
   title: string | null;
@@ -16,9 +18,6 @@ export interface AgentSessionStats {
 interface AgentsListApi {
   agents: {
     list(input?: unknown): Promise<{ entries: unknown[] }>;
-    ref(id: string): {
-      refresh(): Promise<{ agent: unknown } | null>;
-    };
   };
 }
 
@@ -75,15 +74,19 @@ export async function listAgentSessions(paseo: AgentsListApi): Promise<AgentSess
   }
 }
 
-export async function resolveAgentSummary(
-  paseo: AgentsListApi,
-  id: string,
-): Promise<AgentSessionSummary | null> {
-  try {
-    const result = await paseo.agents.ref(id).refresh();
-    if (!result?.agent) return null;
-    return toSummary(result.agent as RawAgent);
-  } catch {
-    return null;
-  }
+// Fallback for agents outside the list window: read the persisted record
+// directly. Do NOT use agents.ref(id).refresh() here — the daemon handles it
+// via ensureAgentLoaded, which spawns the provider process just to answer a
+// metadata query.
+export async function resolveAgentSummary(id: string): Promise<AgentSessionSummary | null> {
+  const record = await readAgentRecordJson(id);
+  if (!record) return null;
+  return {
+    id,
+    title: record.title ?? null,
+    provider: record.provider ?? null,
+    status: record.lastStatus ?? "unknown",
+    cwd: record.cwd ?? null,
+    archivedAt: record.archivedAt ?? null,
+  };
 }

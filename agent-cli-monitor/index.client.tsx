@@ -3,7 +3,7 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { Text } from "react-native";
-import { formatMb, MONITOR_QUERY_KEY, MONITOR_REFETCH_MS, MonitorScreen } from "./client/monitor";
+import { formatMb, MONITOR_QUERY_KEY, MonitorScreen } from "./client/monitor";
 import { monitorSnapshot } from "./shared/monitor";
 
 function MonitorItem({ currentScreen, openScreen, theme }: PluginSidebarItemProps) {
@@ -11,7 +11,7 @@ function MonitorItem({ currentScreen, openScreen, theme }: PluginSidebarItemProp
   const query = useQuery({
     queryKey: MONITOR_QUERY_KEY,
     queryFn: () => snapshot({}),
-    refetchInterval: MONITOR_REFETCH_MS,
+    staleTime: Infinity,
   });
   const data = query.data;
   const summary = data ? `${data.instanceCount} · ${formatMb(data.totalRssBytes)} MB` : "…";
