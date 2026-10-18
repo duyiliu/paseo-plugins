@@ -18,6 +18,7 @@ const agentSession = z.object({
 
 const cliInstance = z.object({
   pid: z.number(),
+  name: z.string(),
   rssBytes: z.number(),
   command: z.string(),
   startedAt: z.string().nullable(),

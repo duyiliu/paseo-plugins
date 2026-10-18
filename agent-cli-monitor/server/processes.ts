@@ -7,7 +7,6 @@ import type { AgentSessionSummary } from "./agents";
 
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 64 * 1024 * 1024;
-const ROOT_NAME = "devin";
 
 export interface ChildProcessInfo {
   pid: number;
@@ -15,8 +14,9 @@ export interface ChildProcessInfo {
   rssBytes: number;
 }
 
-export interface CliInstance {
+export interface AgentCliInstance {
   pid: number;
+  name: string;
   rssBytes: number;
   command: string;
   startedAt: string | null;
@@ -47,8 +47,20 @@ function truncate(text: string, max: number): string {
   return text.length > max ? text.slice(0, max) : text;
 }
 
-// Reads PASEO_AGENT_ID / PASEO_AGENT_CWD out of each devin.exe process
-// environment block via the PEB (NtQueryInformationProcess + ReadProcessMemory).
+function parseEnvMarker(text: string): { agentId: string | null; agentCwd: string | null } {
+  let agentId: string | null = null;
+  let agentCwd: string | null = null;
+  for (const entry of text.split("\0")) {
+    if (entry.startsWith("PASEO_AGENT_ID=")) agentId = entry.slice(15);
+    else if (entry.startsWith("PASEO_AGENT_CWD=")) agentCwd = entry.slice(16);
+  }
+  return { agentId, agentCwd };
+}
+
+// Reads PASEO_AGENT_ID / PASEO_AGENT_CWD out of every process's environment
+// block via the PEB (NtQueryInformationProcess + ReadProcessMemory). The full
+// scan costs roughly a quarter second for ~400 processes, so no name prefilter
+// is needed — the env marker itself decides what is an agent.
 const WINDOWS_PS_SCRIPT = String.raw`
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
 $source = @"
@@ -106,12 +118,7 @@ public static class ProcEnv {
 }
 "@
 Add-Type -TypeDefinition $source -Language CSharp
-$cmds = @{}
-$agentEnv = @{}
-$created = @{}
-Get-CimInstance Win32_Process -Filter "Name='devin.exe'" -Property ProcessId,CommandLine,CreationDate | ForEach-Object {
-  $cmds[[string]$_.ProcessId] = $_.CommandLine
-  if ($_.CreationDate) { $created[[string]$_.ProcessId] = ([datetime]$_.CreationDate).ToUniversalTime().ToString("o") }
+$rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,WorkingSetSize,CommandLine,CreationDate | ForEach-Object {
   $agentId = $null
   $agentCwd = $null
   $block = [ProcEnv]::ReadEnvBlock([int]$_.ProcessId, 262144)
@@ -121,24 +128,25 @@ Get-CimInstance Win32_Process -Filter "Name='devin.exe'" -Property ProcessId,Com
       elseif ($entry.StartsWith("PASEO_AGENT_CWD=")) { $agentCwd = $entry.Substring(16) }
     }
   }
-  $agentEnv[[string]$_.ProcessId] = @{ agentId = $agentId; agentCwd = $agentCwd }
-}
-$rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize,@{N='CommandLine';E={$cmds[[string]$_.ProcessId]}},@{N='StartedAt';E={$created[[string]$_.ProcessId]}},@{N='AgentId';E={$agentEnv[[string]$_.ProcessId].agentId}},@{N='AgentCwd';E={$agentEnv[[string]$_.ProcessId].agentCwd}})
+  [pscustomobject]@{
+    ProcessId = $_.ProcessId
+    ParentProcessId = $_.ParentProcessId
+    Name = $_.Name
+    WorkingSetSize = $_.WorkingSetSize
+    CommandLine = $_.CommandLine
+    StartedAt = $(if ($_.CreationDate) { ([datetime]$_.CreationDate).ToUniversalTime().ToString("o") } else { $null })
+    AgentId = $agentId
+    AgentCwd = $agentCwd
+  }
+})
 if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json -Compress }
 `;
 
-let windowsScriptPath: string | null = null;
-
-async function ensureWindowsScriptPath(): Promise<string> {
-  if (windowsScriptPath) return windowsScriptPath;
-  const target = join(tmpdir(), "paseo-agent-cli-monitor.ps1");
-  await writeFile(target, WINDOWS_PS_SCRIPT, "utf8");
-  windowsScriptPath = target;
-  return target;
-}
-
 async function listWindows(): Promise<RawProcess[]> {
-  const scriptPath = await ensureWindowsScriptPath();
+  // Write the script on every invocation: temp cleaners may remove it between
+  // refreshes, and rewriting also leaves no stale file for tampering.
+  const scriptPath = join(tmpdir(), "paseo-agent-cli-monitor.ps1");
+  await writeFile(scriptPath, WINDOWS_PS_SCRIPT, "utf8");
   const { stdout } = await execFileAsync(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
@@ -173,52 +181,6 @@ async function listWindows(): Promise<RawProcess[]> {
   return out;
 }
 
-async function readPosixAgentEnv(pid: number): Promise<{ agentId: string | null; agentCwd: string | null }> {
-  const parse = (text: string) => {
-    let agentId: string | null = null;
-    let agentCwd: string | null = null;
-    for (const entry of text.split("\0")) {
-      if (entry.startsWith("PASEO_AGENT_ID=")) agentId = entry.slice(15);
-      else if (entry.startsWith("PASEO_AGENT_CWD=")) agentCwd = entry.slice(16);
-    }
-    return { agentId, agentCwd };
-  };
-  try {
-    const raw = await readFile(`/proc/${pid}/environ`);
-    return parse(raw.toString("utf8"));
-  } catch {
-    try {
-      const { stdout } = await execFileAsync("ps", ["eww", "-o", "command=", "-p", String(pid)], {
-        maxBuffer: MAX_BUFFER,
-      });
-      const agentId = /PASEO_AGENT_ID=(\S+)/.exec(stdout)?.[1] ?? null;
-      const agentCwd = /PASEO_AGENT_CWD=(\S+)/.exec(stdout)?.[1] ?? null;
-      return { agentId, agentCwd };
-    } catch {
-      return { agentId: null, agentCwd: null };
-    }
-  }
-}
-
-// `ps -o etime=` reports [[dd-]hh:]mm:ss — no locale issues unlike lstart.
-async function readPosixStartedAt(pid: number): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], {
-      maxBuffer: MAX_BUFFER,
-    });
-    const match = /(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)/.exec(stdout.trim());
-    if (!match) return null;
-    const days = Number(match[1] ?? 0);
-    const hours = Number(match[2] ?? 0);
-    const minutes = Number(match[3]);
-    const seconds = Number(match[4]);
-    const elapsedMs = ((days * 24 + hours) * 60 + minutes) * 60_000 + seconds * 1000;
-    return new Date(Date.now() - elapsedMs).toISOString();
-  } catch {
-    return null;
-  }
-}
-
 async function listPosix(): Promise<RawProcess[]> {
   const { stdout } = await execFileAsync("ps", ["-eo", "pid=,ppid=,rss=,comm=,args="], {
     maxBuffer: MAX_BUFFER,
@@ -242,7 +204,79 @@ async function listPosix(): Promise<RawProcess[]> {
   return out;
 }
 
-function buildInstances(processes: RawProcess[]): CliInstance[] {
+// Linux exposes exact per-process environments through /proc.
+async function fillLinuxEnvironments(processes: RawProcess[]): Promise<void> {
+  await Promise.all(
+    processes.map(async (proc) => {
+      try {
+        const raw = await readFile(`/proc/${proc.pid}/environ`);
+        const env = parseEnvMarker(raw.toString("utf8"));
+        proc.agentId = env.agentId;
+        proc.agentCwd = env.agentCwd;
+      } catch {
+        // Unreadable (kernel threads, other users) — stays unmarked.
+      }
+    }),
+  );
+}
+
+// Other POSIX systems (macOS) have no /proc; `ps eww` appends the environment
+// after the command line for processes owned by the caller.
+async function fillPsEnvironments(processes: RawProcess[]): Promise<void> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync("ps", ["eww", "-Ao", "pid=,command="], {
+      maxBuffer: MAX_BUFFER,
+    }));
+  } catch {
+    return;
+  }
+  const envByPid = new Map<number, { agentId: string | null; agentCwd: string | null }>();
+  for (const line of stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const tail = match[2];
+    const agentId = /PASEO_AGENT_ID=(\S+)/.exec(tail)?.[1] ?? null;
+    if (!agentId) continue;
+    const agentCwd =
+      /PASEO_AGENT_CWD=(.+?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|\s*$)/.exec(tail)?.[1] ?? null;
+    envByPid.set(Number(match[1]), { agentId, agentCwd });
+  }
+  for (const proc of processes) {
+    const env = envByPid.get(proc.pid);
+    if (env) {
+      proc.agentId = env.agentId;
+      proc.agentCwd = env.agentCwd;
+    }
+  }
+}
+
+// `ps -o etime=` reports [[dd-]hh:]mm:ss — no locale issues unlike lstart.
+async function readPosixStartedAt(pid: number): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], {
+      maxBuffer: MAX_BUFFER,
+    });
+    const match = /(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)/.exec(stdout.trim());
+    if (!match) return null;
+    const days = Number(match[1] ?? 0);
+    const hours = Number(match[2] ?? 0);
+    const minutes = Number(match[3]);
+    const seconds = Number(match[4]);
+    const elapsedMs = ((days * 24 + hours) * 60 + minutes) * 60_000 + seconds * 1000;
+    return new Date(Date.now() - elapsedMs).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+// The daemon stamps PASEO_AGENT_ID / PASEO_AGENT_CWD into every agent's launch
+// environment (agent-manager), and descendants inherit them. A process is an
+// instance root when it carries the marker and its parent carries a different
+// one (or none): nested agents still get their own instance. Processes without
+// the marker — manually started CLIs, desktop apps embedding the same
+// binaries — are excluded entirely.
+function buildInstances(processes: RawProcess[]): AgentCliInstance[] {
   const childrenByPpid = new Map<number, RawProcess[]>();
   const byPid = new Map<number, RawProcess>();
   for (const proc of processes) {
@@ -252,36 +286,31 @@ function buildInstances(processes: RawProcess[]): CliInstance[] {
     else childrenByPpid.set(proc.ppid, [proc]);
   }
 
-  const isRoot = (proc: RawProcess) => {
-    if (baseName(proc.name) !== ROOT_NAME) return false;
-    // A devin process nested under another devin process is counted once, as part
-    // of the ancestor's tree.
-    let ancestor = byPid.get(proc.ppid);
-    while (ancestor) {
-      if (baseName(ancestor.name) === ROOT_NAME) return false;
-      ancestor = byPid.get(ancestor.ppid);
-    }
-    return true;
-  };
-
-  const instances: CliInstance[] = [];
-  for (const proc of processes) {
-    if (!isRoot(proc)) continue;
+  const collectTree = (root: RawProcess): { children: ChildProcessInfo[]; total: number } => {
     const children: ChildProcessInfo[] = [];
-    const queue = [...(childrenByPpid.get(proc.pid) ?? [])];
-    const seen = new Set<number>([proc.pid]);
-    let total = proc.rssBytes;
+    const queue = [...(childrenByPpid.get(root.pid) ?? [])];
+    const seen = new Set<number>([root.pid]);
+    let total = root.rssBytes;
     while (queue.length > 0) {
       const child = queue.shift()!;
       if (seen.has(child.pid)) continue;
       seen.add(child.pid);
+      // A child carrying a different PASEO_AGENT_ID is another agent's root;
+      // its subtree belongs to that instance, not this one.
+      if (child.agentId && child.agentId !== root.agentId) continue;
       total += child.rssBytes;
       children.push({ pid: child.pid, name: child.name, rssBytes: child.rssBytes });
       for (const grandchild of childrenByPpid.get(child.pid) ?? []) queue.push(grandchild);
     }
     children.sort((a, b) => b.rssBytes - a.rssBytes);
-    instances.push({
+    return { children, total };
+  };
+
+  const toInstance = (proc: RawProcess): AgentCliInstance => {
+    const { children, total } = collectTree(proc);
+    return {
       pid: proc.pid,
+      name: baseName(proc.name),
       rssBytes: proc.rssBytes,
       command: truncate(proc.command, 240),
       startedAt: proc.startedAt,
@@ -290,24 +319,33 @@ function buildInstances(processes: RawProcess[]): CliInstance[] {
       agent: null,
       children,
       totalRssBytes: total,
-    });
+    };
+  };
+
+  const instances: AgentCliInstance[] = [];
+  for (const proc of processes) {
+    if (!proc.agentId) continue;
+    const parent = byPid.get(proc.ppid);
+    if (parent?.agentId === proc.agentId) continue;
+    instances.push(toInstance(proc));
   }
+
   return instances.sort((a, b) => b.totalRssBytes - a.totalRssBytes);
 }
 
-export async function listDevinInstances(): Promise<CliInstance[]> {
-  const processes = process.platform === "win32" ? await listWindows() : await listPosix();
+export async function listAgentCliInstances(): Promise<AgentCliInstance[]> {
+  const processes =
+    process.platform === "win32" ? await listWindows() : await listPosix();
+  if (process.platform === "linux") {
+    await fillLinuxEnvironments(processes);
+  } else if (process.platform !== "win32") {
+    await fillPsEnvironments(processes);
+  }
   const instances = buildInstances(processes);
   if (process.platform !== "win32") {
     await Promise.all(
       instances.map(async (instance) => {
-        const [env, startedAt] = await Promise.all([
-          readPosixAgentEnv(instance.pid),
-          readPosixStartedAt(instance.pid),
-        ]);
-        instance.agentId = env.agentId;
-        instance.agentCwd = env.agentCwd;
-        instance.startedAt = startedAt;
+        instance.startedAt = await readPosixStartedAt(instance.pid);
       }),
     );
   }

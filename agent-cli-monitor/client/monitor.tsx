@@ -1,7 +1,7 @@
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { monitorCloseAgent, monitorSnapshot } from "../shared/monitor";
 
@@ -40,6 +40,12 @@ export function MonitorScreen({ theme, layout, navigation }: PluginScreenProps) 
   const [closingPid, setClosingPid] = useState<number | null>(null);
   const [closeError, setCloseError] = useState<string | null>(null);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    },
+    [],
+  );
 
   const handleClose = (pid: number, agentId: string | null | undefined) => {
     if (!agentId || closingPid === pid) return;
@@ -133,7 +139,7 @@ export function MonitorScreen({ theme, layout, navigation }: PluginScreenProps) 
       <View style={styles.statsRow}>
         <View>
           <Text style={styles.statValue}>{data ? data.instanceCount : "…"}</Text>
-          <Text style={styles.statLabel}>个 devin 实例</Text>
+          <Text style={styles.statLabel}>个 agent 实例</Text>
         </View>
         <View>
           <Text style={styles.statValue}>{data ? formatMb(data.totalRssBytes) : "…"}</Text>
@@ -159,8 +165,8 @@ export function MonitorScreen({ theme, layout, navigation }: PluginScreenProps) 
             ? agent.title
             : instance.agentId
               ? `agent ${instance.agentId.slice(0, 8)}`
-              : "未关联 agent";
-          const metaParts: string[] = [];
+              : instance.name;
+          const metaParts: string[] = [instance.name];
           if (instance.agentId) metaParts.push(instance.agentId.slice(0, 7));
           if (agent) metaParts.push(agent.archivedAt ? "已归档" : agent.status);
           const age = instance.startedAt ? formatAge(instance.startedAt) : null;
@@ -231,7 +237,7 @@ export function MonitorScreen({ theme, layout, navigation }: PluginScreenProps) 
           );
         })}
         {data && data.instances.length === 0 ? (
-          <Text style={styles.mutedText}>当前没有运行中的 devin 进程。</Text>
+          <Text style={styles.mutedText}>当前没有运行中的 agent CLI 进程。</Text>
         ) : null}
         {closeError ? <Text style={styles.mutedText}>关闭失败:{closeError}</Text> : null}
       </ScrollView>

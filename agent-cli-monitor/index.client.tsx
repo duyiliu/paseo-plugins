@@ -18,7 +18,7 @@ function MonitorItem({ currentScreen, openScreen, theme }: PluginSidebarItemProp
   return (
     <SidebarRow
       icon="Activity"
-      label="Devin 实例"
+      label="Agent 实例"
       active={currentScreen?.screenId === "monitor"}
       trailing={
         <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontVariant: ["tabular-nums"] }}>
@@ -31,13 +31,13 @@ function MonitorItem({ currentScreen, openScreen, theme }: PluginSidebarItemProp
 }
 
 export default function contribute(client: PluginClientContext) {
-  client.addScreen({ id: "monitor", title: "Devin 进程", Component: MonitorScreen });
-  client.addSidebarFooterItem({ id: "monitor", title: "Devin 实例监控", Component: MonitorItem });
+  client.addScreen({ id: "monitor", title: "Agent 进程", Component: MonitorScreen });
+  client.addSidebarFooterItem({ id: "monitor", title: "Agent 实例监控", Component: MonitorItem });
   client.addCommandCenterItem({
     id: "open-monitor",
-    title: "打开 Devin 进程监控",
+    title: "打开 Agent 进程监控",
     icon: "Activity",
-    keywords: ["devin", "process", "memory", "monitor", "cli"],
+    keywords: ["agent", "devin", "claude", "codex", "process", "memory", "monitor", "cli"],
     context: "global",
     onSelect({ openScreen }) {
       openScreen({ screenId: "monitor" });

@@ -1,13 +1,13 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { listAgentSessions, resolveAgentSummary, type AgentSessionSummary } from "./server/agents";
 import { callAgentMcpTool, readAgentMcpEndpoint } from "./server/mcp";
-import { listDevinInstances } from "./server/processes";
+import { listAgentCliInstances } from "./server/processes";
 import { monitorCloseAgent, monitorSnapshot } from "./shared/monitor";
 
 export default function contribute(server: PluginServerContext) {
   server.handle(monitorSnapshot, async (_input, { paseo }) => {
     const [instances, agents] = await Promise.all([
-      listDevinInstances(),
+      listAgentCliInstances(),
       listAgentSessions(paseo),
     ]);
     const agentById = new Map<string, AgentSessionSummary>(
@@ -44,10 +44,10 @@ export default function contribute(server: PluginServerContext) {
   server.handle(monitorCloseAgent, async ({ agentId }, { paseo }) => {
     const [agents, liveInstances] = await Promise.all([
       listAgentSessions(paseo),
-      listDevinInstances(),
+      listAgentCliInstances(),
     ]);
     // The caller must be currently loaded by the daemon — agents owning a live
-    // devin process provably are. Try them first, then the target itself (also
+    // CLI process provably are. Try them first, then the target itself (also
     // loaded whenever it has a process), then the rest as a fallback sweep.
     const liveIds = new Set(
       liveInstances.map((i) => i.agentId).filter((id): id is string => !!id),
