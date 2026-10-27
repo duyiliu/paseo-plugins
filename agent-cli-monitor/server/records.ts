@@ -12,6 +12,10 @@ export interface AgentRecord {
   provider?: string | null;
   lastStatus?: string;
   cwd?: string | null;
+  workspaceId?: string | null;
+  lastActivityAt?: string | null;
+  lastUserMessageAt?: string | null;
+  updatedAt?: string | null;
   archivedAt?: string | null;
   persistence?: {
     metadata?: {
@@ -42,4 +46,69 @@ export async function readAgentRecordJson(agentId: string): Promise<AgentRecord 
     }
   }
   return null;
+}
+
+export interface AgentActivity {
+  lastUserMessageAt: string | null;
+  lastActivityAt: string | null;
+}
+
+// The agents list API exposes lastActivityAt, which the daemon refreshes when
+// it loads an agent (including its startup sweep), so it says nothing about
+// whether the user ever touched the session. The persisted record carries
+// lastUserMessageAt — the honest "last used" — so scan the records once.
+export async function listAgentActivity(): Promise<Map<string, AgentActivity>> {
+  const activity = new Map<string, AgentActivity>();
+  const agentsRoot = join(paseoHome(), "agents");
+  let dirs: string[];
+  try {
+    dirs = await readdir(agentsRoot);
+  } catch {
+    return activity;
+  }
+  await Promise.all(
+    dirs.map(async (dir) => {
+      let files: string[];
+      try {
+        files = await readdir(join(agentsRoot, dir));
+      } catch {
+        return;
+      }
+      await Promise.all(
+        files
+          .filter((file) => file.endsWith(".json"))
+          .map(async (file) => {
+            try {
+              const raw = await readFile(join(agentsRoot, dir, file), "utf8");
+              const record = JSON.parse(raw) as AgentRecord;
+              if (!record.id) return;
+              activity.set(record.id, {
+                lastUserMessageAt: record.lastUserMessageAt ?? null,
+                lastActivityAt: record.lastActivityAt ?? record.updatedAt ?? null,
+              });
+            } catch {
+              // Skip unreadable or malformed records.
+            }
+          }),
+      );
+    }),
+  );
+  return activity;
+}
+
+// Workspace records live in <PASEO_HOME>/projects/workspaces.json — a flat
+// array of { workspaceId, title, cwd, ... }. Same side-effect-free read as the
+// agent records; the title is what the sidebar lists for the workspace.
+export async function listWorkspaceTitles(): Promise<Map<string, string>> {
+  const titles = new Map<string, string>();
+  try {
+    const raw = await readFile(join(paseoHome(), "projects", "workspaces.json"), "utf8");
+    const rows = JSON.parse(raw) as { workspaceId?: string; title?: string | null }[];
+    for (const row of rows) {
+      if (row.workspaceId && row.title) titles.set(row.workspaceId, row.title);
+    }
+  } catch {
+    // Missing or unreadable file — titles stay unresolved.
+  }
+  return titles;
 }

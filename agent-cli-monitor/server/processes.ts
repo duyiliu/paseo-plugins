@@ -8,23 +8,35 @@ import type { AgentSessionSummary } from "./agents";
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 64 * 1024 * 1024;
 
-export interface ChildProcessInfo {
-  pid: number;
-  name: string;
-  rssBytes: number;
+export interface SystemCommit {
+  committedBytes: number;
+  commitLimitBytes: number;
 }
 
-export interface AgentCliInstance {
+export interface InstanceProcess {
   pid: number;
   name: string;
   rssBytes: number;
+  privateBytes: number | null;
   command: string;
-  startedAt: string | null;
-  agentId: string | null;
+}
+
+// One row per agent. An agent owns every process carrying its PASEO_AGENT_ID
+// plus their descendants, collected into a pid set so overlapping trees are
+// only counted once. `pid`/`name` identify the heaviest process in the set —
+// that is what the row is about when you are hunting memory.
+export interface AgentCliInstance {
+  agentId: string;
   agentCwd: string | null;
   agent: AgentSessionSummary | null;
-  children: ChildProcessInfo[];
+  pid: number;
+  name: string;
+  command: string;
+  startedAt: string | null;
+  processes: InstanceProcess[];
+  processCount: number;
   totalRssBytes: number;
+  totalPrivateBytes: number | null;
 }
 
 interface RawProcess {
@@ -32,6 +44,7 @@ interface RawProcess {
   ppid: number;
   name: string;
   rssBytes: number;
+  privateBytes: number | null;
   command: string;
   startedAt: string | null;
   agentId: string | null;
@@ -118,7 +131,7 @@ public static class ProcEnv {
 }
 "@
 Add-Type -TypeDefinition $source -Language CSharp
-$rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,WorkingSetSize,CommandLine,CreationDate | ForEach-Object {
+$rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,WorkingSetSize,PrivatePageCount,CommandLine,CreationDate | ForEach-Object {
   $agentId = $null
   $agentCwd = $null
   $block = [ProcEnv]::ReadEnvBlock([int]$_.ProcessId, 262144)
@@ -133,16 +146,25 @@ $rows = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name
     ParentProcessId = $_.ParentProcessId
     Name = $_.Name
     WorkingSetSize = $_.WorkingSetSize
+    PrivatePageCount = $_.PrivatePageCount
     CommandLine = $_.CommandLine
     StartedAt = $(if ($_.CreationDate) { ([datetime]$_.CreationDate).ToUniversalTime().ToString("o") } else { $null })
     AgentId = $agentId
     AgentCwd = $agentCwd
   }
 })
-if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json -Compress }
+$committed = $null
+$limit = $null
+$mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -ne $mem) { $committed = $mem.CommittedBytes; $limit = $mem.CommitLimit }
+[pscustomobject]@{
+  processes = $rows
+  committedBytes = $committed
+  commitLimitBytes = $limit
+} | ConvertTo-Json -Compress
 `;
 
-async function listWindows(): Promise<RawProcess[]> {
+async function listWindows(): Promise<{ processes: RawProcess[]; systemCommit: SystemCommit | null }> {
   // Write the script on every invocation: temp cleaners may remove it between
   // refreshes, and rewriting also leaves no stale file for tampering.
   const scriptPath = join(tmpdir(), "paseo-agent-cli-monitor.ps1");
@@ -152,8 +174,19 @@ async function listWindows(): Promise<RawProcess[]> {
     ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
     { maxBuffer: MAX_BUFFER },
   );
-  const parsed = JSON.parse(stdout) as unknown;
-  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const envelope = JSON.parse(stdout) as {
+    processes?: unknown;
+    committedBytes?: number | string | null;
+    commitLimitBytes?: number | string | null;
+  };
+  const committedBytes = Number(envelope?.committedBytes);
+  const commitLimitBytes = Number(envelope?.commitLimitBytes);
+  const systemCommit =
+    Number.isFinite(committedBytes) && committedBytes > 0 && Number.isFinite(commitLimitBytes) && commitLimitBytes > 0
+      ? { committedBytes, commitLimitBytes }
+      : null;
+  const parsed = envelope?.processes;
+  const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
   const out: RawProcess[] = [];
   for (const row of rows) {
     const r = row as {
@@ -161,6 +194,7 @@ async function listWindows(): Promise<RawProcess[]> {
       ParentProcessId?: number;
       Name?: string;
       WorkingSetSize?: number;
+      PrivatePageCount?: number | string | null;
       CommandLine?: string | null;
       StartedAt?: string | null;
       AgentId?: string | null;
@@ -172,31 +206,45 @@ async function listWindows(): Promise<RawProcess[]> {
       ppid: r.ParentProcessId ?? 0,
       name: r.Name,
       rssBytes: r.WorkingSetSize ?? 0,
+      privateBytes: r.PrivatePageCount != null ? Number(r.PrivatePageCount) : null,
       command: r.CommandLine ?? "",
       startedAt: r.StartedAt ?? null,
       agentId: r.AgentId ?? null,
       agentCwd: r.AgentCwd ?? null,
     });
   }
-  return out;
+  return { processes: out, systemCommit };
+}
+
+// `ps -o etime=` reports [[dd-]hh:]mm:ss — no locale issues unlike lstart.
+function parseEtime(text: string): string | null {
+  const match = /(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)/.exec(text);
+  if (!match) return null;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4]);
+  const elapsedMs = ((days * 24 + hours) * 60 + minutes) * 60_000 + seconds * 1000;
+  return new Date(Date.now() - elapsedMs).toISOString();
 }
 
 async function listPosix(): Promise<RawProcess[]> {
-  const { stdout } = await execFileAsync("ps", ["-eo", "pid=,ppid=,rss=,comm=,args="], {
+  const { stdout } = await execFileAsync("ps", ["-eo", "pid=,ppid=,rss=,comm=,etime=,args="], {
     maxBuffer: MAX_BUFFER,
   });
   const out: RawProcess[] = [];
   for (const line of stdout.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line);
     if (!match) continue;
-    const [, pidText, ppidText, rssKbText, comm, args] = match;
+    const [, pidText, ppidText, rssKbText, comm, etime, args] = match;
     out.push({
       pid: Number(pidText),
       ppid: Number(ppidText),
       name: comm.split("/").pop() ?? comm,
       rssBytes: Number(rssKbText) * 1024,
+      privateBytes: null,
       command: args,
-      startedAt: null,
+      startedAt: parseEtime(etime),
       agentId: null,
       agentCwd: null,
     });
@@ -251,103 +299,130 @@ async function fillPsEnvironments(processes: RawProcess[]): Promise<void> {
   }
 }
 
-// `ps -o etime=` reports [[dd-]hh:]mm:ss — no locale issues unlike lstart.
-async function readPosixStartedAt(pid: number): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync("ps", ["-o", "etime=", "-p", String(pid)], {
-      maxBuffer: MAX_BUFFER,
-    });
-    const match = /(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)/.exec(stdout.trim());
-    if (!match) return null;
-    const days = Number(match[1] ?? 0);
-    const hours = Number(match[2] ?? 0);
-    const minutes = Number(match[3]);
-    const seconds = Number(match[4]);
-    const elapsedMs = ((days * 24 + hours) * 60 + minutes) * 60_000 + seconds * 1000;
-    return new Date(Date.now() - elapsedMs).toISOString();
-  } catch {
-    return null;
-  }
-}
-
 // The daemon stamps PASEO_AGENT_ID / PASEO_AGENT_CWD into every agent's launch
-// environment (agent-manager), and descendants inherit them. A process is an
-// instance root when it carries the marker and its parent carries a different
-// one (or none): nested agents still get their own instance. Processes without
-// the marker — manually started CLIs, desktop apps embedding the same
-// binaries — are excluded entirely.
+// environment (agent-manager), and descendants inherit them. Every process
+// carrying the marker belongs to that agent, and so do its descendants — that
+// is where most of the memory actually sits. Processes without the marker
+// (manually started CLIs, desktop apps embedding the same binaries) are
+// excluded entirely.
+//
+// Ownership is collected as a pid set rather than a tree walk from one root.
+// An agent legitimately owns several marked processes — its launcher shell, a
+// CLI that outlived it, a detached service — and their trees can be siblings
+// whose parent has already exited. A set makes overlaps and orphans free.
 function buildInstances(processes: RawProcess[]): AgentCliInstance[] {
   const childrenByPpid = new Map<number, RawProcess[]>();
-  const byPid = new Map<number, RawProcess>();
   for (const proc of processes) {
-    byPid.set(proc.pid, proc);
     const list = childrenByPpid.get(proc.ppid);
     if (list) list.push(proc);
     else childrenByPpid.set(proc.ppid, [proc]);
   }
 
-  const collectTree = (root: RawProcess): { children: ChildProcessInfo[]; total: number } => {
-    const children: ChildProcessInfo[] = [];
-    const queue = [...(childrenByPpid.get(root.pid) ?? [])];
-    const seen = new Set<number>([root.pid]);
-    let total = root.rssBytes;
-    while (queue.length > 0) {
-      const child = queue.shift()!;
-      if (seen.has(child.pid)) continue;
-      seen.add(child.pid);
-      // A child carrying a different PASEO_AGENT_ID is another agent's root;
-      // its subtree belongs to that instance, not this one.
-      if (child.agentId && child.agentId !== root.agentId) continue;
-      total += child.rssBytes;
-      children.push({ pid: child.pid, name: child.name, rssBytes: child.rssBytes });
-      for (const grandchild of childrenByPpid.get(child.pid) ?? []) queue.push(grandchild);
-    }
-    children.sort((a, b) => b.rssBytes - a.rssBytes);
-    return { children, total };
-  };
-
-  const toInstance = (proc: RawProcess): AgentCliInstance => {
-    const { children, total } = collectTree(proc);
-    return {
-      pid: proc.pid,
-      name: baseName(proc.name),
-      rssBytes: proc.rssBytes,
-      command: truncate(proc.command, 240),
-      startedAt: proc.startedAt,
-      agentId: proc.agentId,
-      agentCwd: proc.agentCwd,
-      agent: null,
-      children,
-      totalRssBytes: total,
-    };
-  };
-
-  const instances: AgentCliInstance[] = [];
+  const markedByAgent = new Map<string, RawProcess[]>();
   for (const proc of processes) {
     if (!proc.agentId) continue;
-    const parent = byPid.get(proc.ppid);
-    if (parent?.agentId === proc.agentId) continue;
-    instances.push(toInstance(proc));
+    const list = markedByAgent.get(proc.agentId);
+    if (list) list.push(proc);
+    else markedByAgent.set(proc.agentId, [proc]);
   }
 
-  return instances.sort((a, b) => b.totalRssBytes - a.totalRssBytes);
+  const instances: AgentCliInstance[] = [];
+  for (const [agentId, marked] of markedByAgent) {
+    // Fold every marked process and its descendants into one pid set. A child
+    // carrying another agent's marker is that agent's business, not ours.
+    const owned = new Map<number, RawProcess>();
+    const queue = [...marked];
+    while (queue.length > 0) {
+      const proc = queue.shift()!;
+      if (owned.has(proc.pid)) continue;
+      owned.set(proc.pid, proc);
+      for (const child of childrenByPpid.get(proc.pid) ?? []) {
+        if (child.agentId && child.agentId !== agentId) continue;
+        queue.push(child);
+      }
+    }
+
+    const members = [...owned.values()];
+    members.sort((a, b) => (b.privateBytes ?? b.rssBytes) - (a.privateBytes ?? a.rssBytes));
+    const heaviest = members[0];
+    let startedAt: string | null = null;
+    let anyPrivate = false;
+    let totalRssBytes = 0;
+    let totalPrivateBytes = 0;
+    for (const proc of members) {
+      totalRssBytes += proc.rssBytes;
+      if (proc.privateBytes != null) {
+        anyPrivate = true;
+        totalPrivateBytes += proc.privateBytes;
+      }
+      if (proc.startedAt && (startedAt == null || Date.parse(proc.startedAt) < Date.parse(startedAt))) {
+        startedAt = proc.startedAt;
+      }
+    }
+
+    instances.push({
+      agentId,
+      agentCwd: marked.find((proc) => proc.agentCwd)?.agentCwd ?? null,
+      agent: null,
+      pid: heaviest.pid,
+      name: baseName(heaviest.name),
+      command: truncate(heaviest.command, 240),
+      startedAt,
+      processes: members.map((proc) => ({
+        pid: proc.pid,
+        name: baseName(proc.name),
+        rssBytes: proc.rssBytes,
+        privateBytes: proc.privateBytes,
+        command: truncate(proc.command, 240),
+      })),
+      processCount: members.length,
+      totalRssBytes,
+      totalPrivateBytes: anyPrivate ? totalPrivateBytes : null,
+    });
+  }
+
+  // Sort by committed (private) bytes when available — that's what blows the
+  // commit limit — falling back to RSS on platforms without the metric.
+  return instances.sort((a, b) => (b.totalPrivateBytes ?? b.totalRssBytes) - (a.totalPrivateBytes ?? a.totalRssBytes));
 }
 
-export async function listAgentCliInstances(): Promise<AgentCliInstance[]> {
-  const processes =
-    process.platform === "win32" ? await listWindows() : await listPosix();
+// Linux reports the same commit-charge numbers as Windows' \Memory\ counters.
+async function readLinuxSystemCommit(): Promise<SystemCommit | null> {
+  try {
+    const raw = await readFile("/proc/meminfo", "utf8");
+    const committed = /^Committed_AS:\s*(\d+)\s+kB/im.exec(raw);
+    const limit = /^CommitLimit:\s*(\d+)\s+kB/im.exec(raw);
+    if (!committed || !limit) return null;
+    return {
+      committedBytes: Number(committed[1]) * 1024,
+      commitLimitBytes: Number(limit[1]) * 1024,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface AgentCliScan {
+  instances: AgentCliInstance[];
+  systemCommit: SystemCommit | null;
+}
+
+export async function listAgentCliInstances(): Promise<AgentCliScan> {
+  let processes: RawProcess[];
+  let systemCommit: SystemCommit | null = null;
+  if (process.platform === "win32") {
+    ({ processes, systemCommit } = await listWindows());
+  } else {
+    processes = await listPosix();
+    if (process.platform === "linux") {
+      systemCommit = await readLinuxSystemCommit();
+    }
+  }
   if (process.platform === "linux") {
     await fillLinuxEnvironments(processes);
   } else if (process.platform !== "win32") {
     await fillPsEnvironments(processes);
   }
   const instances = buildInstances(processes);
-  if (process.platform !== "win32") {
-    await Promise.all(
-      instances.map(async (instance) => {
-        instance.startedAt = await readPosixStartedAt(instance.pid);
-      }),
-    );
-  }
-  return instances;
+  return { instances, systemCommit };
 }

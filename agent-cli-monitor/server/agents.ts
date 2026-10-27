@@ -1,4 +1,4 @@
-import { readAgentRecordJson } from "./records";
+import { listAgentActivity, listWorkspaceTitles, readAgentRecordJson, type AgentActivity } from "./records";
 
 export interface AgentSessionSummary {
   id: string;
@@ -6,6 +6,10 @@ export interface AgentSessionSummary {
   provider: string | null;
   status: string;
   cwd: string | null;
+  workspaceId: string | null;
+  workspaceTitle: string | null;
+  lastActivityAt: string | null;
+  lastUserMessageAt: string | null;
   archivedAt: string | null;
 }
 
@@ -27,6 +31,9 @@ interface RawAgent {
   provider?: string | null;
   status?: string;
   cwd?: string | null;
+  workspaceId?: string | null;
+  lastActivityAt?: string | null;
+  updatedAt?: string | null;
   archivedAt?: string | null;
 }
 
@@ -35,29 +42,43 @@ function unwrap(entry: unknown): RawAgent {
   return candidate.agent ?? candidate;
 }
 
-function toSummary(agent: RawAgent): AgentSessionSummary | null {
+function toSummary(
+  agent: RawAgent,
+  workspaceTitles: Map<string, string>,
+  activity: Map<string, AgentActivity>,
+): AgentSessionSummary | null {
   if (!agent.id || !agent.status) return null;
+  const workspaceId = agent.workspaceId ?? null;
+  const record = activity.get(agent.id);
   return {
     id: agent.id,
     title: agent.title ?? null,
     provider: agent.provider ?? null,
     status: agent.status,
     cwd: agent.cwd ?? null,
+    workspaceId,
+    workspaceTitle: workspaceId ? (workspaceTitles.get(workspaceId) ?? null) : null,
+    lastActivityAt: agent.lastActivityAt ?? agent.updatedAt ?? record?.lastActivityAt ?? null,
+    lastUserMessageAt: record?.lastUserMessageAt ?? null,
     archivedAt: agent.archivedAt ?? null,
   };
 }
 
 export async function listAgentSessions(paseo: AgentsListApi): Promise<AgentSessionStats | null> {
   try {
-    const { entries } = await paseo.agents.list({
-      filter: { includeArchived: true },
-      sort: [{ key: "updated_at", direction: "desc" }],
-      page: { limit: 200 },
-    });
+    const [{ entries }, workspaceTitles, activity] = await Promise.all([
+      paseo.agents.list({
+        filter: { includeArchived: true },
+        sort: [{ key: "updated_at", direction: "desc" }],
+        page: { limit: 200 },
+      }),
+      listWorkspaceTitles(),
+      listAgentActivity(),
+    ]);
     const byStatus: Record<string, number> = {};
     const items: AgentSessionSummary[] = [];
     for (const entry of entries) {
-      const summary = toSummary(unwrap(entry));
+      const summary = toSummary(unwrap(entry), workspaceTitles, activity);
       if (!summary) continue;
       // Archived agents stay in items so live processes can still resolve names,
       // but they do not count toward the session summary.
@@ -81,12 +102,18 @@ export async function listAgentSessions(paseo: AgentsListApi): Promise<AgentSess
 export async function resolveAgentSummary(id: string): Promise<AgentSessionSummary | null> {
   const record = await readAgentRecordJson(id);
   if (!record) return null;
+  const workspaceId = record.workspaceId ?? null;
+  const workspaceTitles = await listWorkspaceTitles();
   return {
     id,
     title: record.title ?? null,
     provider: record.provider ?? null,
     status: record.lastStatus ?? "unknown",
     cwd: record.cwd ?? null,
+    workspaceId,
+    workspaceTitle: workspaceId ? (workspaceTitles.get(workspaceId) ?? null) : null,
+    lastActivityAt: record.lastActivityAt ?? record.updatedAt ?? null,
+    lastUserMessageAt: record.lastUserMessageAt ?? null,
     archivedAt: record.archivedAt ?? null,
   };
 }
