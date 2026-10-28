@@ -1,9 +1,15 @@
 {
   "id": "agent-cli-monitor",
   "name": "Agent CLI Monitor",
-  "description": "查看本机正在运行的 agent CLI 实例数量和内存占用",
+  "description": "Shows running agent CLI instances and their memory use in the Paseo sidebar.",
   "media": [],
   "requirements": {
     "paseo": ">=0.11.1"
+  },
+  "translations": {
+    "zh-CN": {
+      "name": "Agent CLI 监控",
+      "description": "在 Paseo 侧边栏显示正在运行的 agent CLI 实例及其内存占用。"
+    }
   }
 }
